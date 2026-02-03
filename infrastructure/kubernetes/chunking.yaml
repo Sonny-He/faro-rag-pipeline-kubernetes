@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: document-chunking
+  namespace: rag-services
+  labels:
+    app: document-chunking
+spec:
+  type: ClusterIP
+  selector:
+    app: document-chunking
+  ports:
+    - protocol: TCP
+      port: 80         # Internal cluster port
+      targetPort: 8000 # Container port (FastAPI)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: document-chunking
+  namespace: rag-services
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: document-chunking
+  template:
+    metadata:
+      labels:
+        app: document-chunking
+    spec:
+      serviceAccountName: rag-services-sa
+      containers:
+        - name: document-chunking
+          image: 894866952568.dkr.ecr.eu-central-1.amazonaws.com/faro-rag/document-chunking:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: AWS_REGION
+              value: "eu-central-1"
+            - name: S3_BUCKET
+              value: "faro-rag-documents-eu-central-1"
+            - name: S3_ENABLED
+              value: "true"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: embeddings-engine
+  namespace: rag-services
+  labels:
+    app: embeddings-engine
+spec:
+  type: ClusterIP
+  selector:
+    app: embeddings-engine
+  ports:
+    - protocol: TCP
+      port: 80         # Port accessible inside the cluster
+      targetPort: 8001 # Port the container listens on
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embeddings-engine
+  namespace: rag-services
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: embeddings-engine
+  template:
+    metadata:
+      labels:
+        app: embeddings-engine
+    spec:
+      serviceAccountName: rag-services-sa
+      containers:
+        - name: embeddings-engine
+          image: 894866952568.dkr.ecr.eu-central-1.amazonaws.com/faro-rag/embeddings-engine:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          env:
+            - name: AWS_REGION
+              value: "eu-central-1"
+            - name: PORTKEY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: portkey-api-key
+            - name: QDRANT_URL
+              value: "http://10.0.11.10:6333"
+            - name: QDRANT_COLLECTION
+              value: "faro_docs"
+            # --- POSTGRES CONFIGURATION ---
+            - name: PG_HOST
+              value: "rag-vector-db.c16woq02g7fg.eu-central-1.rds.amazonaws.com"
+            - name: PG_DB
+              value: "vectordb"
+            - name: PG_USER
+              value: "vectoradmin"
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: db-password
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

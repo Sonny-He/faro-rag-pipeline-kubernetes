@@ -1,0 +1,409 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - destroy
+
+env:
+  AWS_REGION: eu-central-1
+  TF_VERSION: 1.6.0
+
+jobs:
+  setup:
+    name: Setup & Validate
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      should_destroy: ${{ steps.check.outputs.should_destroy }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Determine Action
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ACTION="${{ github.event.inputs.action }}"
+          else
+            ACTION="plan"
+          fi
+          
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+          echo "should_deploy=$( [[ $ACTION == 'deploy' ]] && echo 'true' || echo 'false' )" >> $GITHUB_OUTPUT
+          echo "should_destroy=$( [[ $ACTION == 'destroy' ]] && echo 'true' || echo 'false' )" >> $GITHUB_OUTPUT
+          
+          echo "🎯 Action: $ACTION"
+
+  terraform:
+    name: Terraform ${{ needs.setup.outputs.should_destroy == 'true' && 'Destroy' || needs.setup.outputs.should_deploy == 'true' && 'Deploy' || 'Plan' }}
+    runs-on: ubuntu-latest
+    needs: setup
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || 'arn:aws:iam::894866952568:role/github-actions-terraform-role' }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Terraform
+          
+      - name: Verify AWS Identity
+        run: |
+          echo "### 🔐 AWS Identity" >> $GITHUB_STEP_SUMMARY
+          aws sts get-caller-identity | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Setup Backend
+        run: |
+          echo "Ensuring backend resources exist..."
+          
+          BUCKET="faro-rag-terraform-state-894866952568"
+          TABLE="faro-rag-terraform-locks"
+          
+          # Create S3 bucket if it doesn't exist
+          if ! aws s3 ls s3://$BUCKET 2>/dev/null; then
+            echo "Creating backend bucket..."
+            aws s3 mb s3://$BUCKET --region ${{ env.AWS_REGION }}
+            aws s3api put-bucket-versioning --bucket $BUCKET --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption --bucket $BUCKET --server-side-encryption-configuration '{
+              "Rules": [{
+                "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}
+              }]
+            }'
+            echo "✅ Backend bucket created"
+          else
+            echo "✅ Backend bucket exists"
+          fi
+          
+          # Create DynamoDB table if it doesn't exist
+          if ! aws dynamodb describe-table --table-name $TABLE --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Creating DynamoDB lock table..."
+            aws dynamodb create-table \
+              --table-name $TABLE \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST \
+              --region ${{ env.AWS_REGION }}
+            
+            echo "Waiting for table to be active..."
+            aws dynamodb wait table-exists --table-name $TABLE --region ${{ env.AWS_REGION }}
+            echo "✅ DynamoDB lock table created"
+          else
+            echo "✅ DynamoDB lock table exists"
+          fi
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -upgrade
+
+      - name: Configure Kubeconfig (EKS)
+        run: |
+          # Only attempt kubeconfig if Terraform has a cluster_name output
+          if terraform output -raw cluster_name >/dev/null 2>&1; then
+            RAW_CLUSTER_NAME="$(terraform output -raw cluster_name)"
+            CLUSTER_NAME="$(printf '%s' "$RAW_CLUSTER_NAME" | tr -d '\r\n\t ' | tr -cd '[:print:]')"
+
+            echo "Cluster from state: '$CLUSTER_NAME'"
+
+            # Only proceed if the cluster actually exists in AWS
+            if aws eks describe-cluster --name "$CLUSTER_NAME" --region "${AWS_REGION}" >/dev/null 2>&1; then
+              aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${AWS_REGION}"
+            else
+              echo "EKS cluster '$CLUSTER_NAME' not found in AWS. Skipping kubeconfig."
+            fi
+          else
+            echo "No cluster_name output found. Skipping kubeconfig."
+          fi
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Pre-Destroy Cleanup
+        if: needs.setup.outputs.should_destroy == 'true'
+        run: |
+          echo "Running pre-destroy cleanup..."
+          
+          # Empty S3 document bucket
+          BUCKET="faro-rag-documents-eu-central-1"
+          if aws s3 ls s3://$BUCKET 2>/dev/null; then
+            echo "Emptying bucket $BUCKET..."
+            
+            # Delete all versions
+            aws s3api list-object-versions --bucket $BUCKET --query 'Versions[*].[Key,VersionId]' --output text | \
+              while read key versionId; do
+                if [ ! -z "$key" ]; then
+                  aws s3api delete-object --bucket $BUCKET --key "$key" --version-id "$versionId" || true
+                fi
+              done
+            
+            # Delete all delete markers
+            aws s3api list-object-versions --bucket $BUCKET --query 'DeleteMarkers[*].[Key,VersionId]' --output text | \
+              while read key versionId; do
+                if [ ! -z "$key" ]; then
+                  aws s3api delete-object --bucket $BUCKET --key "$key" --version-id "$versionId" || true
+                fi
+              done
+            
+            echo "✅ Bucket cleaned"
+          fi
+          
+          # Clean up network interfaces and subnet dependencies
+          echo "Cleaning up network dependencies..."
+          
+          # Find VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=faro-rag-vpc" --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+          
+          if [ ! -z "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            echo "Found VPC: $VPC_ID"
+            
+            # Delete NAT Gateways first (they block subnet deletion)
+            echo "Cleaning up NAT Gateways..."
+            aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting" \
+              --query 'NatGateways[*].NatGatewayId' --output text | tr '\t' '\n' | \
+              while read nat_id; do
+                if [ ! -z "$nat_id" ]; then
+                  echo "Deleting NAT Gateway: $nat_id"
+                  aws ec2 delete-nat-gateway --nat-gateway-id $nat_id 2>/dev/null || true
+                fi
+              done
+            
+            # Wait longer for NAT Gateways to be deleted
+            echo "Waiting for NAT Gateways to be fully deleted..."
+            for i in {1..12}; do
+              ACTIVE_NAT=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting" --query 'length(NatGateways)' --output text)
+              if [ "$ACTIVE_NAT" == "0" ]; then
+                echo "All NAT Gateways deleted"
+                break
+              fi
+              echo "Waiting... ($i/12) - $ACTIVE_NAT NAT Gateways still active"
+              sleep 15
+            done
+            
+            # Clean up ALL network interfaces in VPC (including in-use ones)
+            echo "Cleaning up ALL network interfaces in VPC..."
+            aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NetworkInterfaces[*].[NetworkInterfaceId,Attachment.AttachmentId,Status,Description]' --output text | \
+              while IFS=$'\t' read -r eni_id attachment_id status description; do
+                if [ ! -z "$eni_id" ]; then
+                  echo "Processing ENI: $eni_id (Status: $status, Desc: $description)"
+                  
+                  # Force detach if attached
+                  if [ ! -z "$attachment_id" ] && [ "$attachment_id" != "None" ]; then
+                    echo "  Detaching: $attachment_id"
+                    aws ec2 detach-network-interface --attachment-id $attachment_id --force 2>/dev/null || true
+                    sleep 3
+                  fi
+                  
+                  # Try to delete
+                  echo "  Deleting: $eni_id"
+                  aws ec2 delete-network-interface --network-interface-id $eni_id 2>/dev/null || true
+                  sleep 1
+                fi
+              done
+            
+            # Wait a bit more for ENIs to be fully deleted
+            echo "Waiting for network interfaces to be fully deleted..."
+            sleep 15
+            
+            # List any remaining ENIs for debugging
+            echo "Checking for remaining network interfaces..."
+            aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NetworkInterfaces[*].[NetworkInterfaceId,SubnetId,Status,Description]' --output table || true
+            
+            echo "✅ Network dependencies cleaned"
+          else
+            echo "VPC not found or already deleted"
+          fi
+
+      - name: Terraform Plan
+        id: plan
+        env:
+          TF_VAR_portkey_api_key: ${{ secrets.PORTKEY_API_KEY }}
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD || 'ChangeMe123!' }}
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ "${{ needs.setup.outputs.should_destroy }}" == "true" ]]; then
+            terraform plan -destroy -no-color -out=tfplan | tee plan.txt
+          else
+            terraform plan -no-color -out=tfplan | tee plan.txt
+          fi
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_number }}
+          path: |
+            tfplan
+            plan.txt
+          retention-days: 7
+
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const truncatedPlan = plan.length > 65000 ? plan.substring(0, 65000) + '\n\n... (truncated)' : plan;
+            
+            const body = `## 📋 Terraform Plan
+            
+            \`\`\`terraform
+            ${truncatedPlan}
+            \`\`\`
+            
+            **Action**: ${{ needs.setup.outputs.should_destroy == 'true' && 'Destroy' || 'Deploy' }}
+            **Format**: ${{ steps.fmt.outcome }}
+            **Init**: ${{ steps.init.outcome }}
+            **Validate**: ${{ steps.validate.outcome }}
+            **Plan**: ${{ steps.plan.outcome }}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Terraform Apply/Destroy
+        if: steps.plan.outcome == 'success' && (needs.setup.outputs.should_deploy == 'true' || needs.setup.outputs.should_destroy == 'true') && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+        env:
+          TF_VAR_portkey_api_key: ${{ secrets.PORTKEY_API_KEY }}
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD || needs.setup.outputs.should_destroy == 'true' && 'dummy' || 'ChangeMe123!' }}
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          terraform apply -auto-approve tfplan
+      
+      - name: Post-Destroy Cleanup
+        if: needs.setup.outputs.should_destroy == 'true'
+        continue-on-error: true
+        run: |
+          echo "Running post-destroy cleanup of any remaining resources..."
+          
+          # Find any remaining VPCs with our naming pattern OR our CIDR block
+          echo "Cleaning up any orphaned VPCs..."
+          aws ec2 describe-vpcs --filters "Name=cidr,Values=10.0.0.0/16" --query 'Vpcs[?IsDefault==`false`].VpcId' --output text | tr '\t' '\n' | \
+            while read vpc_id; do
+              if [ ! -z "$vpc_id" ]; then
+                echo "Found VPC: $vpc_id"
+                
+                # Delete all subnets in VPC
+                echo "  Deleting subnets..."
+                aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc_id" --query 'Subnets[*].SubnetId' --output text | tr '\t' '\n' | \
+                  while read subnet_id; do
+                    if [ ! -z "$subnet_id" ]; then
+                      echo "    Deleting subnet: $subnet_id"
+                      aws ec2 delete-subnet --subnet-id $subnet_id 2>/dev/null || true
+                    fi
+                  done
+                
+                # Delete internet gateways
+                echo "  Deleting internet gateways..."
+                aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$vpc_id" --query 'InternetGateways[*].InternetGatewayId' --output text | tr '\t' '\n' | \
+                  while read igw_id; do
+                    if [ ! -z "$igw_id" ]; then
+                      echo "    Detaching and deleting IGW: $igw_id"
+                      aws ec2 detach-internet-gateway --internet-gateway-id $igw_id --vpc-id $vpc_id 2>/dev/null || true
+                      aws ec2 delete-internet-gateway --internet-gateway-id $igw_id 2>/dev/null || true
+                    fi
+                  done
+                
+                # Delete route tables (except main)
+                echo "  Deleting route tables..."
+                aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --query 'RouteTables[?Associations[0].Main==`false`].RouteTableId' --output text | tr '\t' '\n' | \
+                  while read rt_id; do
+                    if [ ! -z "$rt_id" ]; then
+                      echo "    Deleting route table: $rt_id"
+                      aws ec2 delete-route-table --route-table-id $rt_id 2>/dev/null || true
+                    fi
+                  done
+                
+                # Delete security groups (except default)
+                echo "  Deleting security groups..."
+                aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc_id" --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text | tr '\t' '\n' | \
+                  while read sg_id; do
+                    if [ ! -z "$sg_id" ]; then
+                      echo "    Deleting security group: $sg_id"
+                      aws ec2 delete-security-group --group-id $sg_id 2>/dev/null || true
+                    fi
+                  done
+                
+                # Finally delete VPC
+                echo "  Deleting VPC: $vpc_id"
+                aws ec2 delete-vpc --vpc-id $vpc_id 2>/dev/null || echo "  VPC deletion failed, may have dependencies"
+              fi
+            done
+          
+          echo "✅ Post-destroy cleanup completed"
+
+      - name: Terraform Outputs
+        if: needs.setup.outputs.should_deploy == 'true' && steps.plan.outcome == 'success'
+        run: |
+          echo "## 📤 Terraform Outputs" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update Kubeconfig
+        if: needs.setup.outputs.should_deploy == 'true' && steps.plan.outcome == 'success'
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "faro-rag-cluster")
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+          
+          echo "## ☸️ Kubernetes Cluster" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get nodes 2>/dev/null || echo "Cluster not ready yet" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy K8s Manifests
+        if: needs.setup.outputs.should_deploy == 'true' && steps.plan.outcome == 'success'
+        run: |
+          # 1. Replace the hardcoded endpoint with the real one (Simple hack for automation)
+          RDS_ENDPOINT=$(terraform output -raw rds_endpoint)
+          sed -i "s|rag-vector-db.*.amazonaws.com|$RDS_ENDPOINT|g" k8s/embeddings.yaml
+          
+          # 2. Apply all manifests
+          kubectl apply -f k8s/service-account.yaml
+          kubectl apply -f k8s/
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 📊 Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: ${{ needs.setup.outputs.should_destroy == 'true' && '🗑️  Destroy' || needs.setup.outputs.should_deploy == 'true' && '🚀 Deploy' || '📋 Plan' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: dev" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actor**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY

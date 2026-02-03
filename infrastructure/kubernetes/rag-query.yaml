@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-query
+  namespace: rag-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-query
+  template:
+    metadata:
+      labels:
+        app: rag-query
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: rag-query
+          image: 894866952568.dkr.ecr.eu-central-1.amazonaws.com/faro-rag/rag-query:latest
+          ports:
+            - containerPort: 8002
+          env:
+            - name: QDRANT_URL
+              value: "http://10.0.11.10:6333"
+            - name: QDRANT_COLLECTION
+              value: "faro_docs"
+            - name: EMBEDDINGS_ENGINE_URL
+              value: "http://embeddings-engine"
+            - name: EMBEDDINGS_ENDPOINT
+              value: "/embed"
+            - name: AWS_REGION
+              value: "eu-central-1"
+            - name: PG_HOST
+              # IMPORTANT: Replace this with the RDS Endpoint from 'terraform output rds_endpoint' if different
+              value: "rag-vector-db.c16woq02g7fg.eu-central-1.rds.amazonaws.com"
+            - name: PG_DB
+              value: "vectordb"
+            - name: PG_USER
+              value: "vectoradmin"
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: db-password
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secrets
+                  key: openai-api-key
+            - name: LLM_MODEL
+              value: "gpt-4o-mini" 
+            - name: LLM_BASE_URL
+              value: "https://api.openai.com/v1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-query
+  namespace: rag-services
+  labels:
+    app: rag-query
+spec:
+  selector:
+    app: rag-query
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8002
+  type: ClusterIP
