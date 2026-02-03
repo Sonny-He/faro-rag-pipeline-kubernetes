@@ -10,6 +10,29 @@
 
 ---
 
+## 📚 Complete Documentation
+
+**[📄 View Full Technical Documentation (PDF)](docs/documentation/faro-rag-pipeline-documentation.pdf)**
+
+> 📖 Comprehensive technical documentation covering the dual-storage architecture, shadow testing methodology, DOT framework analysis, and security implementation details.
+
+### 📑 What's Covered:
+
+| Chapter | Topic | Description |
+|---------|-------|-------------|
+| 1️⃣ | **Architecture & Design** | Dual-storage strategy, network topology, and design decisions |
+| 2️⃣ | **Infrastructure as Code** | Complete Terraform modules and deployment guide |
+| 3️⃣ | **Microservices Architecture** | FastAPI services, API contracts, and communication patterns |
+| 4️⃣ | **Vector Databases** | Qdrant vs PostgreSQL pgvector comparison and configuration |
+| 5️⃣ | **Shadow Testing Methodology** | Parallel query strategy and performance measurement |
+| 6️⃣ | **Security Implementation** | Security groups, IAM policies, and Zero Trust principles |
+| 7️⃣ | **Observability Stack** | Prometheus metrics, Grafana dashboards, and alerting |
+| 8️⃣ | **DOT Framework Research** | Database comparison research and selection criteria |
+| 9️⃣ | **CI/CD Pipeline** | GitHub Actions workflows and OIDC authentication |
+| 🔟 | **Operations Guide** | Deployment procedures, troubleshooting, and maintenance |
+
+---
+
 ## 📋 Table of Contents
 
 - [Overview](#-overview)
